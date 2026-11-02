@@ -136,6 +136,13 @@ a stated limit), **missing** (not on the phone yet), **not from a phone**
 | Clear All Notifications | Feed > Filter menu > **Clear All Notifications** | works (parity2) | `notification.clear` on the Mac's current session (new on the lane, see SECURITY.md); the Feed's terminal events go with it. No confirmation, as on the Mac. |
 | Mute workspace | Feed > Filter > Workspaces toggles | partial | The phone's mute is the phone's own (the Mac's mute is not on the lane). |
 
+## Mac Screen
+
+| Mac action | Phone | State | Notes |
+| --- | --- | --- | --- |
+| View another Mac's screen (Mac Screen tab, streamed on cmux.rd/1) | the Screen Sharing viewer (CmuxMobileScreenSharing) | partial | The phone views over WebRTC. A Mac host takes its protocol from the viewer's offer: a cmux.rd/1 document runs `cmux rd serve`, any other offer runs ScreenStreamHost, so Macs and phones both reach it. The phone has no cmux.rd/1 link yet: iOS cannot start the Mac's helper process, so the link has to come in as a library. code-checked; live pending |
+| Share This Mac (serve a session) | | not from a phone | A phone views Macs; it is not a screen host. |
+
 ## Workspace list order (parity2 decision)
 
 The phone's Workspaces list follows the Mac's sidebar: **Needs You** first (the
