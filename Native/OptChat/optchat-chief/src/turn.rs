@@ -1044,14 +1044,11 @@ pub fn run_after_capacity_waits(
         let error = outcome.error.clone().unwrap_or_default();
         // A newer message or a stop came: the turn stops as for it, and its
         // passing error is never posted, on the last try too.
-        if interrupt.is_set()
-            && outcome.reply.is_none()
-            && transient_retry_after(&error, 0).is_some()
-        {
+        if interrupt.is_set() && outcome.reply.is_none() && turn_retry_after(&outcome, 0).is_some() {
             outcome.cancelled = true;
             return outcome;
         }
-        let Some(wait) = transient_retry_after(&error, attempt) else {
+        let Some(wait) = turn_retry_after(&outcome, attempt) else {
             return outcome;
         };
         let why = if capacity_retry_after(&error).is_some() {
@@ -1114,26 +1111,36 @@ pub fn is_connection_error(error: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-/// Whether `error` says a turn's start got no answer in time, before its
-/// prompt was sent: Chief's own deadline on `session/new`
-/// (`acpmux::SESSION_NEW_DEADLINE`), on the harness list or on the system
-/// prompt, or acpmux's on the agent (`agent_start did not finish within 90s`).
-/// The machine is too slow right now, and nothing ran, so a new try repeats
-/// nothing. A timeout after the prompt never counts: that turn may have done
-/// its work, and running it again would repeat its sends and spawns.
+/// Whether `error` says a start got no answer in time: Chief's own deadline on
+/// a control call (`no answer within 60 s` for the harness list,
+/// `acpmux::SESSION_NEW_DEADLINE` for `session/new`), or acpmux's on the agent
+/// (`agent_start did not finish within 90s`). The text alone says nothing
+/// about whether the turn ran: a fallback that cannot start after a turn's
+/// sends reads the same. [`turn_retry_after`] checks that.
 pub fn is_start_stall(error: &str) -> bool {
-    error.contains("agent_start did not finish within")
-        || (error.contains("no answer within")
-            && (error.contains("session/new")
-                || error.contains("what its harnesses are")
-                || error.starts_with("setting the turn's system prompt")))
+    error.contains("no answer within") || error.contains("agent_start did not finish within")
+}
+
+/// The wait before try `attempt` (0-based) runs this turn again: a transient
+/// error's ([`transient_retry_after`]), or for a start that stalled before the
+/// prompt was accepted 1 s doubling to [`CONNECTION_MAX_WAIT`] for
+/// [`CONNECTION_TRIES`] tries. Nothing ran on such a turn (`start_ms` is set
+/// once `start_prompt` succeeds), so a new try repeats nothing; a turn whose
+/// prompt went out never runs again for a stall, as it may have done its work.
+pub fn turn_retry_after(outcome: &TurnOutcome, attempt: u32) -> Option<Duration> {
+    let error = outcome.error.as_deref().unwrap_or_default();
+    if let Some(wait) = transient_retry_after(error, attempt) {
+        return Some(wait);
+    }
+    (is_start_stall(error) && outcome.stats.start_ms.is_none() && attempt < CONNECTION_TRIES)
+        .then(|| Duration::from_secs(1u64 << attempt.min(16)).min(CONNECTION_MAX_WAIT))
 }
 
 /// The wait before try `attempt` (0-based) runs a turn again after a
 /// transient error: a capacity refusal's own retry-after, or for a
-/// connection error or a stalled start 1 s doubling to
-/// [`CONNECTION_MAX_WAIT`] for [`CONNECTION_TRIES`] tries. None for any other
-/// error, and once the tries are spent.
+/// connection error 1 s doubling to [`CONNECTION_MAX_WAIT`] for
+/// [`CONNECTION_TRIES`] tries. None for any other error, and once the tries
+/// are spent.
 pub fn transient_retry_after(error: &str, attempt: u32) -> Option<Duration> {
     if let Some(wait) = capacity_retry_after(error) {
         return Some(wait);
@@ -1142,7 +1149,7 @@ pub fn transient_retry_after(error: &str, attempt: u32) -> Option<Duration> {
     if is_idle_error(error) {
         return (attempt == 0).then_some(Duration::ZERO);
     }
-    if !(is_connection_error(error) || is_start_stall(error)) || attempt >= CONNECTION_TRIES {
+    if !is_connection_error(error) || attempt >= CONNECTION_TRIES {
         return None;
     }
     Some(Duration::from_secs(1u64 << attempt.min(16)).min(CONNECTION_MAX_WAIT))
@@ -1172,22 +1179,29 @@ pub fn is_idle_error(error: &str) -> bool {
 
 #[cfg(test)]
 mod start_stall_tests {
-    use super::{CONNECTION_TRIES, transient_retry_after};
+    use super::{CONNECTION_TRIES, TurnOutcome, TurnStats, turn_retry_after};
     use std::time::Duration;
 
     const STALL: &str = "session/new: no answer within 200 s";
 
+    /// A turn that ended with `error`, its prompt accepted or not.
+    fn ended(error: &str, prompt_sent: bool) -> TurnOutcome {
+        TurnOutcome {
+            error: Some(error.to_owned()),
+            stats: TurnStats {
+                start_ms: prompt_sent.then_some(1),
+                ..TurnStats::default()
+            },
+            ..TurnOutcome::default()
+        }
+    }
+
     #[test]
     fn a_stalled_start_runs_the_turn_again_with_a_growing_wait() {
-        assert_eq!(
-            transient_retry_after(STALL, 0),
-            Some(Duration::from_secs(1))
-        );
-        assert_eq!(
-            transient_retry_after(STALL, 3),
-            Some(Duration::from_secs(8))
-        );
-        assert_eq!(transient_retry_after(STALL, CONNECTION_TRIES), None);
+        let turn = ended(STALL, false);
+        assert_eq!(turn_retry_after(&turn, 0), Some(Duration::from_secs(1)));
+        assert_eq!(turn_retry_after(&turn, 3), Some(Duration::from_secs(8)));
+        assert_eq!(turn_retry_after(&turn, CONNECTION_TRIES), None);
     }
 
     #[test]
@@ -1198,7 +1212,7 @@ mod start_stall_tests {
             "setting the turn's system prompt: no answer within 60 s",
         ] {
             assert_eq!(
-                transient_retry_after(error, 0),
+                turn_retry_after(&ended(error, false), 0),
                 Some(Duration::from_secs(1)),
                 "{error}"
             );
@@ -1206,44 +1220,46 @@ mod start_stall_tests {
     }
 
     #[test]
+    fn a_turn_whose_prompt_went_out_never_runs_again_for_a_stall() {
+        for error in [
+            "events: no answer within 60 s",
+            "the fallback profile X cannot start: agent_start did not finish within 90s",
+            "refused: acpmux did not say what its harnesses are (no answer within 60 s). Fix it",
+            STALL,
+        ] {
+            assert_eq!(turn_retry_after(&ended(error, true), 0), None, "{error}");
+        }
+    }
+
+    #[test]
+    fn a_connection_error_still_runs_again_after_the_prompt() {
+        assert_eq!(
+            turn_retry_after(&ended("API Error: Connection error.", true), 0),
+            Some(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
     fn a_newer_message_during_the_wait_stops_the_turn_quietly() {
         let interrupt = super::Interrupt::new();
         interrupt.request();
-        let outcome = super::TurnOutcome {
-            error: Some(STALL.to_owned()),
-            ..super::TurnOutcome::default()
-        };
-        let ended = super::run_after_capacity_waits(
-            outcome,
+        let finished = super::run_after_capacity_waits(
+            ended(STALL, false),
             &super::TurnStart::default(),
             &interrupt,
             &|_| {},
             &crate::trace::Trace::off(),
             |_| panic!("no new try after a newer message"),
         );
-        assert!(ended.cancelled);
-    }
-
-    #[test]
-    fn a_timeout_after_the_prompt_never_runs_the_turn_again() {
-        for error in [
-            "events: no answer within 60 s",
-            "acpmux did not say which harness runs abc (no answer within 60 s)",
-        ] {
-            assert_eq!(transient_retry_after(error, 0), None, "{error}");
-        }
+        assert!(finished.cancelled);
     }
 
     #[test]
     fn a_newer_message_on_the_last_try_stops_the_turn_quietly() {
         let interrupt = super::Interrupt::new();
-        let outcome = super::TurnOutcome {
-            error: Some(STALL.to_owned()),
-            ..super::TurnOutcome::default()
-        };
         let mut tries = 0u32;
-        let ended = super::run_after_capacity_waits(
-            outcome,
+        let finished = super::run_after_capacity_waits(
+            ended(STALL, false),
             &super::TurnStart::default(),
             &interrupt,
             &|_| {},
@@ -1251,21 +1267,16 @@ mod start_stall_tests {
             |_| {
                 tries += 1;
                 interrupt.request();
-                super::TurnOutcome {
-                    error: Some(STALL.to_owned()),
-                    ..super::TurnOutcome::default()
-                }
+                ended(STALL, false)
             },
         );
         assert_eq!(tries, 1);
-        assert!(ended.cancelled);
+        assert!(finished.cancelled);
     }
 
     #[test]
     fn a_refused_start_still_fails_at_once() {
-        assert_eq!(
-            transient_retry_after("session/new: env key X is not one a session may set", 0),
-            None
-        );
+        let turn = ended("session/new: env key X is not one a session may set", false);
+        assert_eq!(turn_retry_after(&turn, 0), None);
     }
 }
