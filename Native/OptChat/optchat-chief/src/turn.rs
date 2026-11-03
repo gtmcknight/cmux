@@ -1044,7 +1044,8 @@ pub fn run_after_capacity_waits(
         let error = outcome.error.clone().unwrap_or_default();
         // A newer message or a stop came: the turn stops as for it, and its
         // passing error is never posted, on the last try too.
-        if interrupt.is_set() && outcome.reply.is_none() && turn_retry_after(&outcome, 0).is_some() {
+        if interrupt.is_set() && outcome.reply.is_none() && turn_retry_after(&outcome, 0).is_some()
+        {
             outcome.cancelled = true;
             return outcome;
         }
