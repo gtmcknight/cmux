@@ -1,3 +1,4 @@
+import CmuxNextCloudCredentials
 import Foundation
 
 /// What `cmux cloud start-session` says (``CloudStartSession``, ``CloudStartSessionAsks``): the
@@ -131,6 +132,20 @@ enum CloudStartSessionStrings {
 
     static func dialogGone(_ dialog: String) -> String {
         String(format: String(localized: "cloud.startSession.dialogGone", defaultValue: "No Cloud start %1$@ waits for an answer: it was answered, timed out or ended. `cmux agents dialog list` shows what still waits.", table: "CloudSessions", bundle: .module), dialog)
+    }
+
+    static var loginInvalid: String {
+        String(localized: "cloud.startSession.loginInvalid", defaultValue: "Pass --login as pass (your own login), machine (the machine's own) or none.", table: "CloudSessions", bundle: .module)
+    }
+
+    /// Why a headless start (`cmux cloud start-session`) fails at once instead of asking about the login.
+    static func loginRefused(_ reason: CloudHarnessLoginDecision.Reason, _ asked: Asked) -> String {
+        let text = switch reason {
+        case .machineLoginMissing: String(localized: "cloud.startSession.machineLoginMissing", defaultValue: "%2$@ on %1$@ has no login of its own, and the login choice is machine. Sign in there, or run `%3$@ --login pass` to give it your own login.", table: "CloudSessions", bundle: .module)
+        case .consentFirst: String(localized: "cloud.startSession.consentNeeded", defaultValue: "%2$@ on %1$@ waits for your one-time OK to copy your Claude login to your own Cloud machines, which only you can give. Turn on Use My Claude Login on My Own Cloud Machines in Settings > Machines, then run `%3$@` again.", table: "CloudSessions", bundle: .module)
+        default: String(localized: "cloud.startSession.loginNeeded", defaultValue: "%2$@ on %1$@ has no login, and you haven't chosen how Cloud machines get one. Run `%3$@ --login pass` to give it your own login (kept for every later machine), --login machine to use only a login the machine already has, or --login none.", table: "CloudSessions", bundle: .module)
+        }
+        return String(format: text, asked.machine, asked.agent, asked.command)
     }
 
     static func notInChat(_ asked: Asked) -> String {

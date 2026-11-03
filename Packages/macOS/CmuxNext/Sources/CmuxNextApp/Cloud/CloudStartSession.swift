@@ -1,6 +1,7 @@
 import CmuxNextActions
 import CmuxNextAgentPane
 import CmuxNextCloud
+import CmuxNextCloudCredentials
 import CmuxNextControl
 import CmuxNextDaemon
 import CmuxNextSettings
@@ -34,6 +35,7 @@ struct CloudStartSession {
         var agent: String
         /// A folder on the machine; nil starts in the workspace's folder there.
         var cwd: String?
+        var login = CloudHarnessLoginAsk() // `--login` and whether a prompt may show (+Login); not in ``command``
 
         /// The command that asks for this again, every word as the shell reads it back.
         var command: String {
@@ -190,7 +192,9 @@ struct CloudStartSession {
         }
         let machineID = invocation.target.flatMap { $0.kind == .machine ? $0.id : nil }
         let name = invocation["name"]?.stringValue?.trimmingCharacters(in: .whitespaces)
-        return Request(machineID: machineID, name: name?.isEmpty == false ? name : nil, agent: agent, cwd: cwd)
+        let login: CloudHarnessLoginAsk
+        do { login = try .init(word: invocation["login"]?.stringValue, agent: isAgent(invocation), prompts: CloudHandlers.origin(of: invocation) == .user) } catch { throw ActionFailure(message: CloudStartSessionStrings.loginInvalid) }
+        return Request(machineID: machineID, name: name?.isEmpty == false ? name : nil, agent: agent, cwd: cwd, login: login)
     }
 
     /// Takes or creates the machine, connects, opens the chat's tab there and starts the session.
@@ -208,7 +212,8 @@ struct CloudStartSession {
         try still(name)
         try await connected(session, request, account: account, byPerson: byPerson)
         try still(name)
-        try await passHarnessLogin(session, agent: agent) { try still(name) }
+        try await passHarnessLogin(session, agent: agent, login: request.login) { try still(name) }
+        if let refusal = session.harnessLogin?.refusal { throw ActionFailure(message: CloudStartSessionStrings.loginRefused(refusal, request.asked(machine: name))) }
         guard let host = AgentTabStore.registryHost(of: session.daemon) else {
             throw ActionFailure(message: CloudStartSessionStrings.notConnected(name, id: id, agent: agent))
         }
@@ -402,8 +407,8 @@ struct CloudStartSession {
 
     /// The machine takes the person's harness login before the session starts, as a composer start's does (+Login).
     /// The login may wait on a confirm: `still` checks the asking account after it, as after every wait.
-    func passHarnessLogin(_ session: CloudMachineSession, agent: String, still: () throws -> Void) async throws {
-        _ = await CloudStartChat(services: services).passHarnessLogin(harness: agent, machine: session, codexPrompt: false) // a scripted run never waits on a device code
+    func passHarnessLogin(_ session: CloudMachineSession, agent: String, login: CloudHarnessLoginAsk = .init(), still: () throws -> Void) async throws {
+        _ = await CloudStartChat(services: services).passHarnessLogin(harness: agent, machine: session, codexPrompt: false, ask: login) // a scripted run never waits on a device code
         try still()
     }
     /// How long a machine has to come up (Move to Cloud's own wait).

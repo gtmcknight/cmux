@@ -2,6 +2,7 @@ import AppKit
 import CmuxNextActions
 import CmuxNextAgentPane
 @testable import CmuxNextApp
+import CmuxNextCloudCredentials
 import CmuxNextCloud
 import CmuxNextCompat
 import CmuxNextDaemon
@@ -49,15 +50,28 @@ struct CloudStartSessionTests {
 
     @Test func theRequestTakesTheTargetNameAgentAndFolder() throws {
         let request = try CloudStartSession.request(Self.invocation(target: "vm-a", ["agent": .string(" codex "), "name": .string(" dev "), "cwd": .string("/home/cmux/work/app")]))
-        #expect(request == CloudStartSession.Request(machineID: "vm-a", name: "dev", agent: "codex", cwd: "/home/cmux/work/app"))
+        #expect(request == CloudStartSession.Request(machineID: "vm-a", name: "dev", agent: "codex", cwd: "/home/cmux/work/app", login: .init(byPerson: true, headless: true)))
         let bare = try CloudStartSession.request(Self.invocation(["agent": .string("claude"), "name": .string(""), "cwd": .string("")]))
-        #expect(bare == CloudStartSession.Request(machineID: nil, name: nil, agent: "claude", cwd: nil))
+        #expect(bare == CloudStartSession.Request(machineID: nil, name: nil, agent: "claude", cwd: nil, login: .init(byPerson: true, headless: true)))
     }
 
     @Test(arguments: ["", "Claude Code", "-rf", "claude;rm", String(repeating: "a", count: 65)])
     func aBadAgentIsRefused(agent: String) {
         #expect(throws: ActionFailure(message: CloudStartSessionStrings.agentInvalid)) {
             try CloudStartSession.request(Self.invocation(["agent": .string(agent)]))
+        }
+    }
+
+    /// `--login` is the person's when no agent asks; only the palette may show the first-login confirm.
+    @Test func theLoginFlagIsReadWithWhoGaveIt() throws {
+        let person = try CloudStartSession.request(Self.invocation(["agent": .string("claude"), "login": .string(" Machine ")]))
+        #expect(person.login == CloudHarnessLoginAsk(requested: .machine, byPerson: true, headless: true))
+        let agent = try CloudStartSession.request(Self.invocation(["agent": .string("claude"), "login": .string("pass")], agent: "chat-1"))
+        #expect(agent.login == CloudHarnessLoginAsk(requested: .pass, byPerson: false, headless: true))
+        let palette = try CloudStartSession.request(Self.invocation(["agent": .string("claude")], origin: .user))
+        #expect(palette.login == CloudHarnessLoginAsk(requested: nil, byPerson: true, headless: false))
+        #expect(throws: ActionFailure(message: CloudStartSessionStrings.loginInvalid)) {
+            try CloudStartSession.request(Self.invocation(["agent": .string("claude"), "login": .string("yes")]))
         }
     }
 
