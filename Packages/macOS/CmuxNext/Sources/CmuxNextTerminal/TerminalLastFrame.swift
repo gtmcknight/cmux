@@ -46,7 +46,8 @@ public final class TerminalLastFrame {
         }.value
     }
 
-    private func pin() -> IOSurface? {
+    /// Makes the frame non-volatile for one reader (a pane that shows it); ``unpin()`` ends that read.
+    func pin() -> IOSurface? {
         guard !purged else { return nil }
         guard surface.reclaim() else {
             purged = true
@@ -56,7 +57,7 @@ public final class TerminalLastFrame {
         return surface
     }
 
-    private func unpin() {
+    func unpin() {
         pins -= 1
         if pins == 0, !taken { surface.makeVolatile() }
     }
