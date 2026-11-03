@@ -56,13 +56,10 @@ final class WorkspaceTabHoverCardRow: NSView {
         layer?.cornerRadius = Metrics.itemCornerRadius
         layer?.cornerCurve = .continuous
         icon.imageScaling = .scaleProportionallyDown
-        title.font = Typography.body
         title.lineBreakMode = .byTruncatingTail
-        detail.font = Typography.caption
         // The line fits itself (`WorkspaceTabHoverCardLine.detail(fitting:font:)`): the place shortens first, and
         // a line still too long ends in an ellipsis, never cut off at the card's edge.
         detail.lineBreakMode = .byTruncatingTail
-        trailingLabel.font = Typography.system(.monospacedDigit, size: Typography.caption.pointSize, weight: .regular)
         activity.tracksWindowOcclusion = true
         unreadDot.wantsLayer = true
         unreadDot.isHidden = true
@@ -90,6 +87,11 @@ final class WorkspaceTabHoverCardRow: NSView {
             pressedTabID = nil
             isHovered = false
         }
+        // The card's text at the sidebar's density and text size, taken again on every configure (the rows are reused).
+        let card = WorkspaceHoverCardView.tokens
+        title.font = Typography.system(.default, size: card.titleSize, weight: .regular)
+        detail.font = Typography.system(.default, size: card.captionSize, weight: .regular)
+        trailingLabel.font = Typography.system(.monospacedDigit, size: card.captionSize, weight: .regular)
         let side = WorkspaceHoverCardView.iconSize
         icon.image = tab.favicon.map { NSImage(cgImage: $0.image, size: NSSize(width: side, height: side)) }
             ?? tab.brand.flatMap { AgentBrandCatalog.templateImage(brand: $0, size: side) }
@@ -133,7 +135,7 @@ final class WorkspaceTabHoverCardRow: NSView {
     }
 
     private func detailWidth(_ text: String) -> CGFloat {
-        ceil((text as NSString).size(withAttributes: [.font: detail.font ?? Typography.caption]).width) + 2 * detail.alignmentRectInsets.left
+        ceil((text as NSString).size(withAttributes: [.font: detail.font ?? Typography.system(.default, size: WorkspaceHoverCardView.tokens.captionSize, weight: .regular)]).width) + 2 * detail.alignmentRectInsets.left
     }
 
     override func setFrameSize(_ newSize: NSSize) {
