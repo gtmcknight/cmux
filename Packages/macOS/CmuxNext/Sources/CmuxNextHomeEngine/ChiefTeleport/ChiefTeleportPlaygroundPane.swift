@@ -17,6 +17,7 @@ final class ChiefTeleportPlaygroundPane: NSView {
 
     override func updateLayer() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
+            // glass-opaque-allow: a Debug playground pane that shows the chip on a plain light or dark window, not a floating surface
             layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
         }
     }
