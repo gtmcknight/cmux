@@ -1253,6 +1253,8 @@ let packageTargets: [Target] = uiLayerPreviewTargets + [
         // app and its system extension, so it depends on nothing in this package.
         .target(
             name: "CmuxNextCloudTunnel",
+            // FileManager.checked for the bundle probe.
+            dependencies: ["CmuxNextCompat"],
             resources: [.process("Resources")],
             swiftSettings: daemonSwiftSettings
         ),
