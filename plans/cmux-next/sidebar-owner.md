@@ -924,7 +924,7 @@ workspaces listed near the end of the sidebar. A later change to group placement
 | (this commit) | Group header and rail left padding (Lawrence 2026-10-25, msg 12385: "groups headers and rails need more left padding"): the bar and the rail keep `SidebarStyle.groupEdgePadding` (`horizontalInset - space1`: 4 pt compact, 6 pt comfortable) from the list's left edge, they sat at 0 and 2 pt. Set by ab905adeadd (lawrencecchen, 2026-10-23, rail on the bar's left edge) over fd82636690f (Leo, 2026-10-21, members flush, #23975). Members unchanged. `SidebarGroupEdgePaddingTests`. |
 
 | (this commit, https://github.com/manaflow-ai/cmux/pull/23958) | Pinned workspace tile color (Austin 2026-10-25): a text-only pinned workspace with a color draws a dot before its title (`SidebarItemRowView.showsSwatchDot`), as its list row does; with none shown, the title alone. Its menu's header gets the name field (the field renames by name, which a tile allows). On hover a workspace tile shows the more button and close x (`SidebarItemRowView+HoverActions`). `SidebarPinnedTileColorTests`. |
-
+| (this commit) | 11-03 | a590's reveal helper (Lawrence's Chief subagents) | cmux-next sidebar: Reveal Workspace in Sidebar opens the folds over the current workspace, scrolls its row to the middle and flashes it; Reveal and Focus Workspace in Sidebar then focuses the list (Lawrence msg 20167). `SidebarRevealInSidebarTests`, gallery `AARevealInSidebarGalleryTests` (~/fun/cmux-galleries/reveal-in-sidebar/). |
 
 ## Codex follow-up
 
