@@ -1343,7 +1343,9 @@ compactions 98.1% of their prefix (spec: 98.6% and 96.2%). What differs:
   them); the next turn reads their summaries. A node the compactor cannot
   build at all (a setup error such as a missing acpmux preset or a refused
   harness, or a request error on every try) is stuck at once and holds no
-  turn; the Chief status says why. The class rule: a user message never
+  turn; the Chief status says why. A line held by a slow machine or an
+  exhausted route (a timeout, a lost link, a capacity error) is a quiet wait
+  that posts no notice; a later try builds it. The class rule: a user message never
   waits more than 1 s on the compactor (a turn's start and `spawn` alike).
   Cost: a deferred turn's cache mark covers a view with placeholders, so the
   next turn, which reads the summaries there, misses the cache from that

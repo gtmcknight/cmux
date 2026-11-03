@@ -2164,20 +2164,8 @@ pub fn probe_retry_wait(error: &str, attempt: u32) -> Option<std::time::Duration
     if let Some(wait) = optchat_host::capacity_wait(error) {
         return Some(wait.min(MAX));
     }
-    let lower = error.to_ascii_lowercase();
-    let transient = [
-        "network error",
-        "check your internet connection",
-        "connection was lost",
-        "connection refused",
-        "connection reset",
-        "timed out",
-        "did not answer within",
-        "overloaded",
-    ]
-    .iter()
-    .any(|t| lower.contains(t));
-    transient.then(|| Duration::from_secs(1u64 << attempt.min(16)).min(MAX))
+    optchat_host::transient_error(error)
+        .then(|| Duration::from_secs(1u64 << attempt.min(16)).min(MAX))
 }
 
 /// The notice a failed start-up probe posts in the Chief conversation;

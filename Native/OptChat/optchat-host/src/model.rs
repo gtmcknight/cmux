@@ -196,6 +196,33 @@ pub fn error_class(message: &str) -> Option<ErrorClass> {
     })
 }
 
+/// Whether `message` says a call got no answer in time or lost its link: the
+/// machine or the route is slow right now, and a later try can pass. This is
+/// a wait, never a fault to post. A request the API refused stays a fault,
+/// whatever its text says.
+pub fn transient_error(message: &str) -> bool {
+    if error_class(message).is_some_and(|c| c.permanent()) {
+        return false;
+    }
+    let lower = message.to_ascii_lowercase();
+    [
+        "network error",
+        "check your internet connection",
+        "connection was lost",
+        "connection refused",
+        "connection reset",
+        "timed out",
+        "did not answer within",
+        // `session/new: no answer within 200 s` (optchat-chief's rpc).
+        "no answer within",
+        // `agent_start did not finish within 90s` (acpmux's own start deadline).
+        "did not finish within",
+        "overloaded",
+    ]
+    .iter()
+    .any(|t| lower.contains(t))
+}
+
 /// How long an exhausted route asks to wait (a 429, 503 or 529, e.g. the
 /// subrouter's "no non-exhausted claude accounts available ... (retry after
 /// 3596s)"): None when `message` is not a capacity error.

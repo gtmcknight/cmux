@@ -57,7 +57,7 @@ impl From<io::Error> for Error {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Failure {
     pub node: NodeId,
-    /// Its first error (later ones are not kept, as they are not reported).
+    /// Its latest error (only the first is reported; a setup error stays).
     pub error: String,
 }
 

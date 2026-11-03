@@ -20,10 +20,11 @@ use crate::state::{Batch, ChildRef, ChildStatus, HostState, Item, PendingTurn};
 use crate::turn::{self, Interrupt, TurnOutcome, TurnStart};
 use optchat_host::{Appended, NewMessage};
 
-/// The notice for the first stuck view line (its node fails with a request
-/// error on every try); None when no line is stuck.
-/// A line held only by an exhausted route (a capacity error) is a quiet
-/// wait, logged by the host: no notice.
+/// The notice for the first stuck view line whose node has a fault to name;
+/// None when there is none.
+/// A line held only by an exhausted route (a capacity error) or by a slow
+/// machine (a timeout, a lost link) is a quiet wait, logged by the host: no
+/// notice. The summary is built on a later try.
 pub fn stuck_notice(status: &optchat_host::Status) -> Option<String> {
     let error = |node: &optchat_core::NodeId| {
         status
@@ -32,17 +33,22 @@ pub fn stuck_notice(status: &optchat_host::Status) -> Option<String> {
             .find(|f| f.node == *node)
             .map(|f| f.error.as_str())
     };
-    let node = status
-        .stuck
-        .iter()
-        .find(|n| error(n).is_none_or(|e| optchat_host::capacity_wait(e).is_none()))?;
+    let node = status.stuck.iter().find(|n| {
+        error(n).is_none_or(|e| {
+            optchat_host::capacity_wait(e).is_none() && !optchat_host::transient_error(e)
+        })
+    })?;
     let class = match error(node) {
         Some(e) if e.starts_with(optchat_host::SETUP_ERROR) => {
             format!("a {}", optchat_core::cut_at_bytes(e, 240))
         }
-        e => e
-            .and_then(optchat_host::error_class)
-            .map_or_else(|| "a request error".to_owned(), |c| c.to_string()),
+        // The error as it reads when it names no HTTP status: never a label
+        // that says more than is known.
+        Some(e) => optchat_host::error_class(e).map_or_else(
+            || optchat_core::cut_at_bytes(e, 240).to_owned(),
+            |c| c.to_string(),
+        ),
+        None => "no error on record".to_owned(),
     };
     Some(format!(
         "The Chief's memory cannot summarize line {} ({class}). Replies go on without that summary; the line stays unsummarized (zoom opens it) until the compactor can build it.",
@@ -157,9 +163,10 @@ impl Brain {
                     settle.clear();
                 }
                 if settled {
-                    // A stuck node (a request error on every try) no longer
-                    // holds the turn: one notice says so, retracted once
-                    // every stuck node is built.
+                    // A stuck node no longer holds the turn: one with a fault to
+                    // name gets one notice, retracted once every stuck node is
+                    // built (the start-up probe's notice shares that slot, so a
+                    // quiet wait left over retracts nothing).
                     let status = chat.status();
                     if let Some(text) = stuck_notice(&status) {
                         let _ = tx.send(Input::CompactorStatus(Err(text)));
@@ -2016,5 +2023,77 @@ impl Brain {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod stuck_notice_tests {
+    use super::stuck_notice;
+    use optchat_core::NodeId;
+    use optchat_host::{Failure, Status};
+
+    fn status(errors: &[&str]) -> Status {
+        let nodes: Vec<NodeId> = (0..errors.len() as u64)
+            .map(|i| NodeId::new(0, i))
+            .collect();
+        Status {
+            messages: 0,
+            view_lines: 0,
+            view_size: 0,
+            budget: 0,
+            unbuilt: 0,
+            built: 0,
+            busy: Vec::new(),
+            failures: nodes
+                .iter()
+                .zip(errors)
+                .map(|(node, e)| Failure {
+                    node: *node,
+                    error: (*e).to_owned(),
+                })
+                .collect(),
+            stuck: nodes,
+            recovered: false,
+            fatal: None,
+            closed: false,
+        }
+    }
+
+    #[test]
+    fn a_slow_machine_is_a_quiet_wait() {
+        for error in [
+            "starting a compactor session: session/new: no answer within 200 s",
+            "the compactor session did not answer within 300 s",
+            "the acpmux connection was lost during a compactor call",
+            "compactor session: session/new: agent_start did not finish within 90s",
+        ] {
+            assert_eq!(stuck_notice(&status(&[error])), None, "{error}");
+        }
+    }
+
+    #[test]
+    fn a_fault_names_its_own_error_never_a_request_error() {
+        let text = stuck_notice(&status(&[
+            "compactor session: You've hit your session limit, resets 4pm",
+        ]))
+        .unwrap();
+        assert!(text.contains("You've hit your session limit"), "{text}");
+        assert!(!text.contains("a request error"), "{text}");
+    }
+
+    #[test]
+    fn a_refused_request_is_a_fault_even_when_its_text_says_timed_out() {
+        let text = stuck_notice(&status(&["API Error: 400 the upload timed out"])).unwrap();
+        assert!(text.contains("400"), "{text}");
+    }
+
+    #[test]
+    fn a_fault_behind_a_quiet_wait_still_posts() {
+        let text = stuck_notice(&status(&[
+            "session/new: no answer within 200 s",
+            "API Error: 400 We've updated our Consumer Terms",
+        ]))
+        .unwrap();
+        assert!(text.contains("400"), "{text}");
     }
 }

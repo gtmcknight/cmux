@@ -457,6 +457,14 @@ pub fn run_with_drafts(
             }) {
                 Ok(id) => id,
                 Err(e) => {
+                    // acpmux may still be starting the session this call gave
+                    // up on: end it, so a try after this one adds no process
+                    // to a machine already too slow to answer.
+                    if is_start_stall(&e)
+                        && let Ok(Some(left)) = agents.find(&spec.name)
+                    {
+                        let _ = agents.end_session(&left);
+                    }
                     return TurnOutcome {
                         error: Some(e),
                         harness: Some(Box::new(admitted)),
@@ -1041,10 +1049,18 @@ pub fn run_after_capacity_waits(
             "the model route has no capacity now"
         } else if is_idle_error(&error) {
             "the harness stopped sending events"
+        } else if is_start_stall(&error) {
+            "the session did not start in time"
         } else {
             "the model API cannot be reached now"
         };
-        if outcome.reply.is_some() || waited + wait > CAPACITY_MAX_WAIT || interrupt.is_set() {
+        if outcome.reply.is_some() || waited + wait > CAPACITY_MAX_WAIT {
+            return outcome;
+        }
+        // A newer message or a stop ended the wait: the turn stops as for it,
+        // and its passing error is never posted.
+        if interrupt.is_set() {
+            outcome.cancelled = true;
             return outcome;
         }
         attempt += 1;
@@ -1058,6 +1074,7 @@ pub fn run_after_capacity_waits(
             serde_json::json!({"turn": start.key, "seconds": wait.as_secs(), "attempt": attempt}),
         );
         if interrupt.wait(wait) {
+            outcome.cancelled = true;
             return outcome;
         }
         waited += wait;
@@ -1094,11 +1111,22 @@ pub fn is_connection_error(error: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+/// Whether `error` says a turn's start got no answer in time: Chief's own
+/// deadline on a control call (`no answer within 60 s` for the harness list,
+/// `acpmux::SESSION_NEW_DEADLINE` for `session/new`), or acpmux's on the agent
+/// (`agent_start did not finish within 90s`). The machine is too slow right
+/// now, and nothing was refused. It runs again like a connection error, as a
+/// whole turn with a growing wait, never in `new_session_with_retry`'s short
+/// loop.
+pub fn is_start_stall(error: &str) -> bool {
+    error.contains("no answer within") || error.contains("agent_start did not finish within")
+}
+
 /// The wait before try `attempt` (0-based) runs a turn again after a
 /// transient error: a capacity refusal's own retry-after, or for a
-/// connection error 1 s doubling to [`CONNECTION_MAX_WAIT`] for
-/// [`CONNECTION_TRIES`] tries. None for any other error, and once the tries
-/// are spent.
+/// connection error or a stalled start 1 s doubling to
+/// [`CONNECTION_MAX_WAIT`] for [`CONNECTION_TRIES`] tries. None for any other
+/// error, and once the tries are spent.
 pub fn transient_retry_after(error: &str, attempt: u32) -> Option<Duration> {
     if let Some(wait) = capacity_retry_after(error) {
         return Some(wait);
@@ -1107,7 +1135,7 @@ pub fn transient_retry_after(error: &str, attempt: u32) -> Option<Duration> {
     if is_idle_error(error) {
         return (attempt == 0).then_some(Duration::ZERO);
     }
-    if !is_connection_error(error) || attempt >= CONNECTION_TRIES {
+    if !(is_connection_error(error) || is_start_stall(error)) || attempt >= CONNECTION_TRIES {
         return None;
     }
     Some(Duration::from_secs(1u64 << attempt.min(16)).min(CONNECTION_MAX_WAIT))
@@ -1133,4 +1161,67 @@ pub fn idle_error(limit: Duration) -> String {
 /// Whether `error` is the idle watchdog's.
 pub fn is_idle_error(error: &str) -> bool {
     error.contains("the turn made no progress for")
+}
+
+#[cfg(test)]
+mod start_stall_tests {
+    use super::{CONNECTION_TRIES, transient_retry_after};
+    use std::time::Duration;
+
+    const STALL: &str = "session/new: no answer within 200 s";
+
+    #[test]
+    fn a_stalled_start_runs_the_turn_again_with_a_growing_wait() {
+        assert_eq!(
+            transient_retry_after(STALL, 0),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            transient_retry_after(STALL, 3),
+            Some(Duration::from_secs(8))
+        );
+        assert_eq!(transient_retry_after(STALL, CONNECTION_TRIES), None);
+    }
+
+    #[test]
+    fn every_way_a_start_times_out_runs_the_turn_again() {
+        for error in [
+            "session/new: agent_start did not finish within 90s (the agent process runs)",
+            "refused: acpmux did not say what its harnesses are (no answer within 60 s). Fix it",
+            "setting the turn's system prompt: no answer within 60 s",
+        ] {
+            assert_eq!(
+                transient_retry_after(error, 0),
+                Some(Duration::from_secs(1)),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_newer_message_during_the_wait_stops_the_turn_quietly() {
+        let interrupt = super::Interrupt::new();
+        interrupt.request();
+        let outcome = super::TurnOutcome {
+            error: Some(STALL.to_owned()),
+            ..super::TurnOutcome::default()
+        };
+        let ended = super::run_after_capacity_waits(
+            outcome,
+            &super::TurnStart::default(),
+            &interrupt,
+            &|_| {},
+            &crate::trace::Trace::off(),
+            |_| panic!("no new try after a newer message"),
+        );
+        assert!(ended.cancelled);
+    }
+
+    #[test]
+    fn a_refused_start_still_fails_at_once() {
+        assert_eq!(
+            transient_retry_after("session/new: env key X is not one a session may set", 0),
+            None
+        );
+    }
 }

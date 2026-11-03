@@ -26,7 +26,8 @@ pub struct State {
     pub store: Db,
     /// Messages appended since the last saved checkpoint.
     pub appended: u64,
-    /// Nodes whose last call failed, with their first error.
+    /// Nodes whose last call failed, with their latest error (a setup error
+    /// stays: it is why the node is stuck).
     pub failing: BTreeMap<NodeId, String>,
     /// Failing nodes whose error repeats on every try (a request error):
     /// settle does not wait for them.
@@ -360,24 +361,30 @@ fn job(shared: Arc<Shared>, request: CompactRequest) {
         *t += 1;
         *t
     };
-    // The first error is kept, but a setup error replaces an ordinary one:
-    // it is why the node is stuck.
-    let replaces = error.setup
-        && st
-            .failing
-            .get(&node)
-            .is_some_and(|e| !e.starts_with(crate::model::SETUP_ERROR));
-    if replaces || !st.failing.contains_key(&node) {
+    // The status keeps the latest error, so a timeout early on cannot hide the
+    // fault that came after it; a setup error stays, it is why the node is
+    // stuck. Only a node's first error is reported, and a setup error that
+    // replaces an ordinary one.
+    let held = st.failing.get(&node);
+    // One that only says the setup timed out holds nothing: a later error shows.
+    let setup_held = held.is_some_and(|e| {
+        e.starts_with(crate::model::SETUP_ERROR) && !crate::model::transient_error(e)
+    });
+    let report = held.is_none()
+        || (error.setup && !held.is_some_and(|e| e.starts_with(crate::model::SETUP_ERROR)));
+    if error.setup || !setup_held {
         // The status keeps the type: a setup error reads "setup error: ...".
         let message = if error.setup {
             format!("{}{}", crate::model::SETUP_ERROR, error.message)
         } else {
             error.message.clone()
         };
-        st.reports.push(Report::NodeFailed {
-            node,
-            error: message.clone(),
-        });
+        if report {
+            st.reports.push(Report::NodeFailed {
+                node,
+                error: message.clone(),
+            });
+        }
         st.failing.insert(node, message);
     }
     // A request error repeats on every try; a transient one may pass, up to

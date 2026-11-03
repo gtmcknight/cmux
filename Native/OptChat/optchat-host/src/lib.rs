@@ -31,8 +31,8 @@ pub use config::{
 pub use db::{Appended, NewMessage, StateWrite};
 pub use fault::{fault, FAULT_ENV};
 pub use model::{
-    capacity_wait, error_class, CompactModel, ErrorClass, Followup, ModelError, Reply,
-    CAPACITY_WAIT, SETUP_ERROR,
+    capacity_wait, error_class, transient_error, CompactModel, ErrorClass, Followup, ModelError,
+    Reply, CAPACITY_WAIT, SETUP_ERROR,
 };
 pub use report::{Report, Reporter};
 
