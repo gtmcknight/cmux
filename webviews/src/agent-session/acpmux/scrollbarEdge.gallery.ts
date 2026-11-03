@@ -12,8 +12,8 @@ const snapshot = chat(
 const native = { "pane.tabState": { inspector: true } };
 /// Session Info opens only on the viewer's click (#26692).
 const open: Play = async (ctx) => {
-  if (!ctx.document.querySelector(".acpmux-chat-inspector")) await ctx.click({ role: "button", name: "Session Info" });
-  await ctx.waitFor(() => ctx.document.querySelector(".acpmux-chat-inspector[data-presence=shown]"));
+  if (!ctx.document.querySelector(".acpmux-session-info")) await ctx.click({ role: "button", name: "Session Info" });
+  await ctx.waitFor(() => ctx.document.querySelector(".acpmux-session-info[data-presence=shown]"));
 };
 
 export default agentPaneEntry({
@@ -21,7 +21,7 @@ export default agentPaneEntry({
   title: "Transcript scrollbar at the pane edge",
   area: "Agent pane",
   height: 700,
-  covers: ["agent-session/acpmux/inspector/inspector.css"],
+  covers: ["agent-session/acpmux/session-info/sessionInfo.css"],
   variants: {
     open: {
       note: "Session Info may move the text column left; the scrollbar stays at the pane's right edge.",
@@ -36,7 +36,7 @@ export default agentPaneEntry({
       play: async (ctx) => {
         await open(ctx);
         await ctx.click({ role: "button", name: "Session Info" });
-        await ctx.waitFor(() => !ctx.document.querySelector(".acpmux-chat-inspector"));
+        await ctx.waitFor(() => !ctx.document.querySelector(".acpmux-session-info"));
       },
     },
   },
