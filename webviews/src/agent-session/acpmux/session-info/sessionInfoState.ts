@@ -266,8 +266,7 @@ export function createSessionInfoStore(storage: () => Storage | undefined = () =
   };
   /// What a chat with no saved state of its own starts with under `key`: closed when it replaces
   /// another chat's session in the pane (`left`) or is a split pane's key, else what the pane shows.
-  const fresh = (key: string, left: boolean): State =>
-    left || key.startsWith(SPLIT_PREFIX) ? closed() : current();
+  const fresh = (key: string, left: boolean): State => (left || key.startsWith(SPLIT_PREFIX) ? closed() : current());
   const update = (next: State, persist: boolean) => {
     if (persist && pane && pane !== leaving) save(pane, next);
     const changed = next !== state;
