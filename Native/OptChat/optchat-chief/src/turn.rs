@@ -1042,6 +1042,15 @@ pub fn run_after_capacity_waits(
     let mut attempt = 0u32;
     loop {
         let error = outcome.error.clone().unwrap_or_default();
+        // A newer message or a stop came: the turn stops as for it, and its
+        // passing error is never posted, on the last try too.
+        if interrupt.is_set()
+            && outcome.reply.is_none()
+            && transient_retry_after(&error, 0).is_some()
+        {
+            outcome.cancelled = true;
+            return outcome;
+        }
         let Some(wait) = transient_retry_after(&error, attempt) else {
             return outcome;
         };
@@ -1055,12 +1064,6 @@ pub fn run_after_capacity_waits(
             "the model API cannot be reached now"
         };
         if outcome.reply.is_some() || waited + wait > CAPACITY_MAX_WAIT {
-            return outcome;
-        }
-        // A newer message or a stop ended the wait: the turn stops as for it,
-        // and its passing error is never posted.
-        if interrupt.is_set() {
-            outcome.cancelled = true;
             return outcome;
         }
         attempt += 1;
@@ -1111,15 +1114,19 @@ pub fn is_connection_error(error: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-/// Whether `error` says a turn's start got no answer in time: Chief's own
-/// deadline on a control call (`no answer within 60 s` for the harness list,
-/// `acpmux::SESSION_NEW_DEADLINE` for `session/new`), or acpmux's on the agent
-/// (`agent_start did not finish within 90s`). The machine is too slow right
-/// now, and nothing was refused. It runs again like a connection error, as a
-/// whole turn with a growing wait, never in `new_session_with_retry`'s short
-/// loop.
+/// Whether `error` says a turn's start got no answer in time, before its
+/// prompt was sent: Chief's own deadline on `session/new`
+/// (`acpmux::SESSION_NEW_DEADLINE`), on the harness list or on the system
+/// prompt, or acpmux's on the agent (`agent_start did not finish within 90s`).
+/// The machine is too slow right now, and nothing ran, so a new try repeats
+/// nothing. A timeout after the prompt never counts: that turn may have done
+/// its work, and running it again would repeat its sends and spawns.
 pub fn is_start_stall(error: &str) -> bool {
-    error.contains("no answer within") || error.contains("agent_start did not finish within")
+    error.contains("agent_start did not finish within")
+        || (error.contains("no answer within")
+            && (error.contains("session/new")
+                || error.contains("what its harnesses are")
+                || error.starts_with("setting the turn's system prompt")))
 }
 
 /// The wait before try `attempt` (0-based) runs a turn again after a
@@ -1214,6 +1221,43 @@ mod start_stall_tests {
             &crate::trace::Trace::off(),
             |_| panic!("no new try after a newer message"),
         );
+        assert!(ended.cancelled);
+    }
+
+    #[test]
+    fn a_timeout_after_the_prompt_never_runs_the_turn_again() {
+        for error in [
+            "events: no answer within 60 s",
+            "acpmux did not say which harness runs abc (no answer within 60 s)",
+        ] {
+            assert_eq!(transient_retry_after(error, 0), None, "{error}");
+        }
+    }
+
+    #[test]
+    fn a_newer_message_on_the_last_try_stops_the_turn_quietly() {
+        let interrupt = super::Interrupt::new();
+        let outcome = super::TurnOutcome {
+            error: Some(STALL.to_owned()),
+            ..super::TurnOutcome::default()
+        };
+        let mut tries = 0u32;
+        let ended = super::run_after_capacity_waits(
+            outcome,
+            &super::TurnStart::default(),
+            &interrupt,
+            &|_| {},
+            &crate::trace::Trace::off(),
+            |_| {
+                tries += 1;
+                interrupt.request();
+                super::TurnOutcome {
+                    error: Some(STALL.to_owned()),
+                    ..super::TurnOutcome::default()
+                }
+            },
+        );
+        assert_eq!(tries, 1);
         assert!(ended.cancelled);
     }
 
