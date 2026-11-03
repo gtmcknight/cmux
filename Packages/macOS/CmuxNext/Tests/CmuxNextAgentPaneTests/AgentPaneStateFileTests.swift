@@ -1,5 +1,4 @@
 import CmuxNextCompat
-import CmuxNextWakeups
 import Foundation
 import Testing
 @testable import CmuxNextAgentPane
@@ -19,7 +18,8 @@ struct AgentPaneStateFileTests {
     @Test func aSaveRunsOffTheMainThreadAndAReadSeesIt() throws {
         let directory = try Self.directory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let file = AgentPaneStateFile.at(directory.appending(path: "a.json"))
+        let files = AgentPaneStateFiles()
+        let file = files.at(directory.appending(path: "a.json"))
         let onMain = Mutex<Bool?>(nil)
         file.write {
             onMain.withLock { $0 = Thread.isMainThread }
@@ -32,13 +32,14 @@ struct AgentPaneStateFileTests {
     @Test func aBurstOfSavesEndsWithTheLast() throws {
         let directory = try Self.directory()
         defer { try? FileManager.default.removeItem(at: directory) }
+        let files = AgentPaneStateFiles()
         let url = directory.appending(path: "b.json")
-        let file = AgentPaneStateFile.at(url)
+        let file = files.at(url)
         for value in 1...50 {
             file.write { Data("\(value)".utf8) }
         }
         // One store per file: a second one for the same path shares the queue, so it reads the last.
-        #expect(AgentPaneStateFile.at(url).read() == Data("50".utf8))
+        #expect(files.at(url).read() == Data("50".utf8))
         // nil removes the file.
         file.write { nil }
         #expect(file.read() == nil)
@@ -64,7 +65,8 @@ struct AgentPaneStateFileTests {
     @Test func savesQueuedBehindARunningOneCollapseToTheNewest() throws {
         let directory = try Self.directory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let file = AgentPaneStateFile.at(directory.appending(path: "o.json"))
+        let files = AgentPaneStateFiles()
+        let file = files.at(directory.appending(path: "o.json"))
         let release = Self.holdQueue(file)
         let encoded = Mutex<[Int]>([])
         for value in 1...20 {
@@ -82,7 +84,8 @@ struct AgentPaneStateFileTests {
         struct Failed: Error {}
         let directory = try Self.directory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let file = AgentPaneStateFile.at(directory.appending(path: "t.json"))
+        let files = AgentPaneStateFiles()
+        let file = files.at(directory.appending(path: "t.json"))
         file.write { Data("good".utf8) }
         #expect(file.read() == Data("good".utf8))
         file.write { throw Failed() }
@@ -92,7 +95,8 @@ struct AgentPaneStateFileTests {
     @Test func aReadFromInsideASaveDoesNotWaitOnItself() throws {
         let directory = try Self.directory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let file = AgentPaneStateFile.at(directory.appending(path: "r.json"))
+        let files = AgentPaneStateFiles()
+        let file = files.at(directory.appending(path: "r.json"))
         file.write { Data("first".utf8) }
         #expect(file.read() == Data("first".utf8))
         let inner = Mutex<Data?>(nil)
@@ -107,8 +111,9 @@ struct AgentPaneStateFileTests {
     @Test func aReadOfAnotherFileFromInsideASaveWaitsForThatFilesSaves() throws {
         let directory = try Self.directory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let a = AgentPaneStateFile.at(directory.appending(path: "a2.json"))
-        let b = AgentPaneStateFile.at(directory.appending(path: "b2.json"))
+        let files = AgentPaneStateFiles()
+        let a = files.at(directory.appending(path: "a2.json"))
+        let b = files.at(directory.appending(path: "b2.json"))
         let release = Self.holdQueue(b)
         b.write { Data("b".utf8) }
         let seen = Mutex<Data?>(nil)
@@ -129,43 +134,63 @@ struct AgentPaneStateFileTests {
         #expect(seen.withLock { $0 } == Data("b".utf8), "read b directly instead of after its queued save")
     }
 
-    @Test func flushAllGivesUpAtItsDeadline() throws {
+    /// A file with a save queued or running is named as saving (the quit deadline records those, by
+    /// name only); once its saves ran it is not.
+    @Test func aFileIsSavingUntilItsQueuedSavesRan() async throws {
         let directory = try Self.directory()
         defer { try? FileManager.default.removeItem(at: directory) }
+        let files = AgentPaneStateFiles()
         let url = directory.appending(path: "d.json")
-        let file = AgentPaneStateFile.at(url)
-        let release = Self.holdQueue(file)
-        file.write { Data("late".utf8) }
-        let started = Date()
-        #expect(AgentPaneStateFile.flushAll(within: 0.2) == false)
-        #expect(Date().timeIntervalSince(started) < 2)
+        let release = Self.holdQueue(files.at(url))
+        files.at(url).write { Data("late".utf8) }
+        _ = files.at(directory.appending(path: "idle.json"))
+        #expect(files.savingFileNames() == ["d.json"])
         release.signal()
-        #expect(AgentPaneStateFile.flushAll(within: 5))
+        await files.drained()
+        #expect(files.savingFileNames().isEmpty)
         #expect((try? Data(contentsOf: url)) == Data("late".utf8))
     }
 
-    @Test func flushAllWaitsForQueuedSaves() throws {
+    @Test func drainedWaitsForQueuedSaves() async throws {
         let directory = try Self.directory()
         defer { try? FileManager.default.removeItem(at: directory) }
+        let files = AgentPaneStateFiles()
         let url = directory.appending(path: "c.json")
-        AgentPaneStateFile.at(url).write { Data("quit".utf8) }
-        #expect(AgentPaneStateFile.flushAll())
+        files.at(url).write { Data("quit".utf8) }
+        await files.drained()
         #expect((try? Data(contentsOf: url)) == Data("quit".utf8))
     }
 
-    @Test func unsentDraftsAndScrollPlacesSurviveAFreshStore() async throws {
+    /// The quit awaits the saves after its deadline is armed: the wait holds no thread (the main actor
+    /// lets the held save go once the drain began; a wait that blocked it would never end, and the time
+    /// limit fails the test), and it ends once the saves queued before it ran.
+    @Test(.timeLimit(.minutes(1)))
+    func drainedAwaitsQueuedSavesWithoutBlocking() async throws {
         let directory = try Self.directory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let work = BackgroundWork(label: "test.agent-pane-state")
-        let drafts = AgentUnsentDrafts(directory: directory, work: work)
+        let began = AsyncStream.makeStream(of: Void.self, bufferingPolicy: .bufferingNewest(1))
+        let files = AgentPaneStateFiles(drainBegan: { began.continuation.yield() })
+        let url = directory.appending(path: "e.json")
+        let release = Self.holdQueue(files.at(url))
+        files.at(url).write { Data("forced".utf8) }
+        let drained = Task { await files.drained() }
+        for await _ in began.stream { break }
+        release.signal()
+        await drained.value
+        #expect((try? Data(contentsOf: url)) == Data("forced".utf8))
+    }
+
+    @Test func unsentDraftsAndScrollPlacesSurviveAFreshStore() throws {
+        let directory = try Self.directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let files = AgentPaneStateFiles()
+        let drafts = AgentUnsentDrafts(directory: directory, files: files)
         drafts.set("first", for: "tab-1")
         drafts.set("second", for: "tab-1")
-        await drafts.flushed()
-        let relaunched = AgentUnsentDrafts(directory: directory, work: work)
+        let relaunched = AgentUnsentDrafts(directory: directory, files: files)
         #expect(relaunched.hasDraft("tab-1"))
-        let anchors = AgentPaneScrollAnchors(directory: directory, work: work)
+        let anchors = AgentPaneScrollAnchors(directory: directory, files: files)
         anchors.remember(AgentPaneScrollAnchor(rowId: "row-3", offset: 4), for: "s-1")
-        await anchors.flushed()
-        #expect(AgentPaneScrollAnchors(directory: directory, work: work).anchor(for: "s-1") == AgentPaneScrollAnchor(rowId: "row-3", offset: 4))
+        #expect(AgentPaneScrollAnchors(directory: directory, files: files).anchor(for: "s-1") == AgentPaneScrollAnchor(rowId: "row-3", offset: 4))
     }
 }

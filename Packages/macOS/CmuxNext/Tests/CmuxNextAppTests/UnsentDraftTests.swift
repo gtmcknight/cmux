@@ -1,8 +1,4 @@
 import CmuxNextAgentPane
-import CmuxNextActions
-import CmuxNextCompat
-import CmuxNextDaemon
-import CmuxNextWakeups
 import Foundation
 import Testing
 @testable import CmuxNextApp
@@ -13,12 +9,6 @@ import Testing
 /// has a session, acpmux keeps its draft and the tab's copy is gone.
 @MainActor
 struct UnsentDraftTests {
-    private static func until(_ ready: () -> Bool) async -> Bool {
-        let clock = ContinuousClock(), deadline = clock.now.advanced(by: .seconds(5))
-        while !ready(), clock.now < deadline { await Task.yield() }
-        return ready()
-    }
-
     static func request(_ method: String, _ params: [String: Any]) -> AgentPaneRequest {
         AgentPaneRequest(body: ["method": method, "params": params])
     }
@@ -27,18 +17,16 @@ struct UnsentDraftTests {
         let directory = FileManager.default.temporaryDirectory.appending(path: "unsent-drafts-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let file = directory.appending(path: AgentUnsentDrafts.fileName)
+        let file = directory.appending(path: AgentUnsentDrafts.fileName), files = AgentPaneStateFiles()
 
         // This run's drafts, held as the tab store holds them.
-        let work = BackgroundWork(label: "test.unsent-drafts")
-        let drafts = AgentUnsentDrafts(file: file, work: work)
+        let drafts = AgentUnsentDrafts(file: file, files: files)
         let model = AgentPaneModel(host: MockAgentPaneHost())
         drafts.wire(model) { "tab-1" }
         _ = await model.respond(to: Self.request("chat.unsentDraft", ["text": "compare the two retry policies"]))
-        await drafts.flushed()
 
         // The next run's tab, still without a session, opens as the chat with its draft.
-        let relaunched = AgentUnsentDrafts(file: file, work: nil)
+        let relaunched = AgentUnsentDrafts(file: file, files: files)
         let seed = try #require(relaunched.seed(for: "tab-1", session: nil))
         #expect(await seed.take()?.draft == "compare the two retry policies")
         #expect(relaunched.seed(for: "tab-1", session: "s-1") == nil, "a chat with a session keeps its draft in acpmux")
@@ -46,112 +34,217 @@ struct UnsentDraftTests {
 
         // The first prompt starts the chat's session: the tab's copy goes, and later text is acpmux's.
         _ = await model.respond(to: Self.request("chat.persistSession", ["sessionId": "s-1"]))
-        await drafts.flushed()
-        #expect(AgentUnsentDrafts(file: file, work: nil).seed(for: "tab-1", session: nil) == nil)
+        #expect(AgentUnsentDrafts(file: file, files: files).seed(for: "tab-1", session: nil) == nil)
         _ = await model.respond(to: Self.request("chat.unsentDraft", ["text": "later"]))
-        await drafts.flushed()
-        #expect(AgentUnsentDrafts(file: file, work: nil).seed(for: "tab-1", session: nil) == nil)
+        #expect(AgentUnsentDrafts(file: file, files: files).seed(for: "tab-1", session: nil) == nil)
         withExtendedLifetime(drafts) {}
     }
 
-    @Test func aDraftDuringEngineStopIsRefusedAfterTheFinalDrain() async throws {
-        let directory = FileManager.default.temporaryDirectory.appending(path: "unsent-drafts-quit-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    /// cmux#32276: a new chat whose tab opens another chat leaves its text (typed, and prompts held
+    /// for a trust answer) in its window's one slot, on disk: a second leftover adds to it, the
+    /// window's next new chat takes it once, and nothing sends it.
+    @Test func aNewChatsTextLeftWhenItsTabOpensAnotherChatWaitsForTheWindowsNextNewChat() async throws {
+        let directory = try Self.directory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let file = directory.appending(path: AgentUnsentDrafts.fileName)
-        let work = BackgroundWork(label: "test.unsent-drafts-quit")
-        let drafts = AgentUnsentDrafts(file: file, work: work)
+        let file = directory.appending(path: AgentUnsentDrafts.fileName), files = AgentPaneStateFiles()
+        let drafts = AgentUnsentDrafts(file: file, files: files)
+        drafts.windowOfTab = { $0 == "tab-1" || $0 == "tab-2" ? "window-1" : nil }
         let model = AgentPaneModel(host: MockAgentPaneHost())
         drafts.wire(model) { "tab-1" }
-        let accepted = await model.respond(to: Self.request("chat.unsentDraft", ["text": "before engine stop"]))
-        #expect(accepted["ok"] as? Bool == true)
-        await AgentPanePersistenceQuit(drafts: drafts, anchors: nil, work: work).drain()
+        _ = await model.respond(to: Self.request("chat.unsentDraft", ["text": "typed here"]))
+        _ = await model.respond(to: Self.request("chat.leftover", ["text": "held prompt\n\ntyped here"]))
+        // The tab opens chat B: its own copy goes, the window's slot stays.
+        _ = await model.respond(to: Self.request("chat.persistSession", ["sessionId": "s-b"]))
+        // A chat with a session leaves nothing.
+        _ = await model.respond(to: Self.request("chat.leftover", ["text": "not a new chat's"]))
+        // Another new chat of the same window leaves its own: it adds to the first.
+        let other = AgentPaneModel(host: MockAgentPaneHost())
+        drafts.wire(other) { "tab-2" }
+        _ = await other.respond(to: Self.request("chat.leftover", ["text": "second"]))
 
-        // CEF shutdown can now suspend while the WebKit bridge still pumps page requests.
-        let late = await model.respond(to: Self.request("chat.unsentDraft", ["text": "after the final drain"]))
-        #expect(late["ok"] as? Bool == false, "a save cannot be acknowledged after the quit's last drain")
-        await work.shutdown() // test cleanup also drains the unfixed implementation's late save
-        let relaunched = AgentUnsentDrafts(file: file, work: nil)
-        #expect(await relaunched.seed(for: "tab-1", session: nil)?.take()?.draft == "before engine stop")
+        // After a quit: the window's next New Tab page gets both; no other window has any.
+        let relaunched = AgentUnsentDrafts(file: file, files: files)
+        #expect(relaunched.seed(for: "tab-1", session: nil) == nil, "the left text is no tab's draft")
+        #expect(relaunched.leftover(inWindow: "window-2") == nil)
+        #expect(relaunched.leftover(inWindow: "window-1") == "held prompt\n\ntyped here\n\nsecond")
+        // A page that never shows (its tab failed to open) gives nothing up: the next page gets it.
+        #expect(relaunched.leftover(inWindow: "window-1") == "held prompt\n\ntyped here\n\nsecond")
+        // A page reports it showed the first part; what was left after it was read stays. Another
+        // window's slot with the same text is never its to give up.
+        relaunched.leave("second", inWindow: "window-2")
+        let page = AgentPaneModel(host: MockAgentPaneHost())
+        relaunched.windowOfTab = { $0 == "tab-5" ? "window-2" : "window-1" }
+        relaunched.wire(page) { "tab-3" }
+        #expect(page.newTabForPage == nil, "only a New Tab page gets it")
+        // A New Tab page its host gave none (a workspace's first page, a restored one) reads its window's.
+        let first = AgentPaneModel(host: MockAgentPaneHost(), newTab: AgentPaneNewTab(kind: .agent))
+        relaunched.wire(first) { "tab-4" }
+        #expect(first.newTabForPage?.draft == "held prompt\n\ntyped here\n\nsecond")
+        _ = await page.respond(to: Self.request("chat.leftoverTaken", ["text": "held prompt\n\ntyped here"]))
+        #expect(relaunched.leftover(inWindow: "window-1") == "second")
+        _ = await page.respond(to: Self.request("chat.leftoverTaken", ["text": "second"]))
+        #expect(relaunched.leftover(inWindow: "window-1") == nil, "a leftover seeds one new chat")
+        #expect(relaunched.leftover(inWindow: "window-2") == "second", "window 2's slot is its own")
+        #expect(AgentUnsentDrafts(file: file, files: files).leftover(inWindow: "window-1") == nil)
+        let elsewhere = AgentPaneModel(host: MockAgentPaneHost())
+        relaunched.wire(elsewhere) { "tab-5" }
+        _ = await elsewhere.respond(to: Self.request("chat.leftoverTaken", ["text": "second"]))
+        #expect(relaunched.leftover(inWindow: "window-2") == nil)
+        withExtendedLifetime(relaunched) {}
+        withExtendedLifetime(drafts) {}
     }
 
-    @Test(arguments: [false, true])
-    func aPendingTabsAcceptedDraftFollowsItsRealIDDuringQuit(abandoned: Bool) async throws {
-        let directory = FileManager.default.temporaryDirectory.appending(path: "unsent-drafts-identity-\(UUID().uuidString)")
+    static func directory() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "unsent-drafts-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let file = directory.appending(path: AgentUnsentDrafts.fileName)
-        let work = BackgroundWork(label: "test.unsent-drafts-identity")
-        let drafts = AgentUnsentDrafts(file: file, work: work)
-        let tabs = AgentTabStore(build: nil, registry: ActionRegistry.standard(), environment: [:], showcase: true,
-                                 defaults: UserDefaults())
-        tabs.unsentDrafts = drafts
-        let provisional = ProvisionalTab().id
-        tabs.track(provisional, in: DaemonStore())
-        defer { tabs.release("tab-real"); tabs.release(provisional) }
-        let text = "accepted while the tab was still being created"
-        #expect(drafts.set(text, for: provisional))
-        await drafts.flushed()
-
-        var quitFinished = false
-        let quit = Task {
-            await AgentPanePersistenceQuit(drafts: drafts, anchors: nil, work: work).drain()
-            quitFinished = true
-        }
-        // Observe the public refusal boundary, without sleeps or a test-only quit hook. Repeating
-        // the unchanged text queues no save while the quit task gets its main-actor turn.
-        #expect(await Self.until { !drafts.set(text, for: provisional) }, "quit did not seal new edits")
-        #expect(!quitFinished, "quit must settle an accepted draft's identity before its final drain")
-        // The pending create's reply or event echo uses this same rekey path while quit awaits.
-        if abandoned { tabs.release(provisional) } else { tabs.rekey(provisional, to: "tab-real") }
-        await quit.value
-
-        let relaunched = AgentUnsentDrafts(file: file, work: nil)
-        #expect(await relaunched.seed(for: "tab-real", session: nil)?.take()?.draft == (abandoned ? nil : text))
-        #expect(relaunched.seed(for: provisional, session: nil) == nil)
-        await work.shutdown() // cleanup happens only after the durability assertions
+        return directory
     }
 
-    @Test func aPendingTabWithoutADraftDoesNotKeepQuitWaiting() async {
-        let drafts = AgentUnsentDrafts(file: nil, work: nil)
-        let tabs = AgentTabStore(build: nil, registry: ActionRegistry.standard(), environment: [:], showcase: true,
-                                 defaults: UserDefaults())
-        tabs.unsentDrafts = drafts
-        let provisional = ProvisionalTab().id
-        tabs.track(provisional, in: DaemonStore())
-        var quitFinished = false
-        let quit = Task {
-            await AgentPanePersistenceQuit(drafts: drafts, anchors: nil, work: nil).drain()
-            quitFinished = true
-        }
-        let finishedWithoutIdentity = await Self.until { quitFinished }
-        tabs.release(provisional) // also cleans up a broken implementation that waited for an empty draft
-        await quit.value
-        #expect(finishedWithoutIdentity)
+    /// A relaunch: the page's text before it is handed the tab's kept draft (its empty editor, or
+    /// what the person typed while it loaded) never replaces that draft; once handed it, the page's
+    /// clear still clears.
+    @Test func aKeptDraftSurvivesTheLoadAndAClearStillClears() async throws {
+        let directory = try Self.directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appending(path: AgentUnsentDrafts.fileName), files = AgentPaneStateFiles()
+        AgentUnsentDrafts(file: file, files: files).set("the saved draft", for: "tab-1")
+
+        let drafts = AgentUnsentDrafts(file: file, files: files)
+        let model = AgentPaneModel(host: MockAgentPaneHost())
+        drafts.wire(model) { "tab-1" }
+        // (c) The page's empty text before it has the draft is no clear.
+        _ = await model.respond(to: Self.request("chat.unsentDraft", ["text": ""]))
+        #expect(AgentUnsentDrafts(file: file, files: files).draft(for: "tab-1") == "the saved draft")
+        // (a, b) Text typed before the draft reached the page joins it, after it.
+        _ = await model.respond(to: Self.request("chat.unsentDraft", ["text": "typed while loading"]))
+        #expect(AgentUnsentDrafts(file: file, files: files).draft(for: "tab-1") == "the saved draft\n\ntyped while loading")
+        // The page still has not taken the draft: its next text is still only its typing, merged with
+        // the kept draft, never in place of it (cmux#28204 review at 027ee470: "x" then "xy" left "xy").
+        _ = await model.respond(to: Self.request("chat.unsentDraft", ["text": "typed while loading, more"]))
+        #expect(AgentUnsentDrafts(file: file, files: files).draft(for: "tab-1") == "the saved draft\n\ntyped while loading, more")
+        // Deleting its typing leaves the kept draft, which the page never had.
+        _ = await model.respond(to: Self.request("chat.unsentDraft", ["text": ""]))
+        #expect(AgentUnsentDrafts(file: file, files: files).draft(for: "tab-1") == "the saved draft")
+        // (d) Once the page takes it (its seed), the page's text is the draft: deleting it clears it.
+        let seed = try #require(drafts.seed(for: "tab-1", session: nil))
+        _ = await seed.take()
+        _ = await model.respond(to: Self.request("chat.unsentDraft", ["text": ""]))
+        #expect(AgentUnsentDrafts(file: file, files: files).draft(for: "tab-1") == nil)
+        withExtendedLifetime(drafts) {}
     }
 
-    /// #25852 (threading item 1, main-thread blocking): a draft holds up to a million characters and is saved
-    /// on every settled edit; its encode and write run on the files lane, never on the main thread, and the
-    /// quit's `BackgroundWork.shutdown()` still puts the last edit on disk.
-    @Test func aDraftIsSavedOffTheMainThreadAndTheQuitKeepsTheLastEdit() async throws {
-        let directory = FileManager.default.temporaryDirectory.appending(path: "unsent-drafts-main-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    /// (c, d) Once the page was handed the draft (the tab's seed), an empty text is the person's clear.
+    @Test func aClearAfterTheSeedClears() async throws {
+        let directory = try Self.directory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let file = directory.appending(path: AgentUnsentDrafts.fileName)
-        // concurrency-allow: test recorder written by the lane thread, read after the shutdown (lock carve-out).
-        let onMain = Mutex<[Bool]>([])
-        let work = BackgroundWork(label: "test.unsent-drafts")
-        let drafts = AgentUnsentDrafts(file: file, work: work) { url, data in
-            onMain.withLock { $0.append(Thread.isMainThread) }
-            StateFileWriter.disk(url, data)
-        }
-        drafts.set("first words", for: "tab-1")
-        drafts.set("first words, then more", for: "tab-1")
-        await work.shutdown()
+        let file = directory.appending(path: AgentUnsentDrafts.fileName), files = AgentPaneStateFiles()
+        AgentUnsentDrafts(file: file, files: files).set("the saved draft", for: "tab-1")
 
-        #expect(!onMain.withLock { $0 }.isEmpty)
-        #expect(onMain.withLock { $0 }.allSatisfy { !$0 }, "a draft was written on the main thread")
-        let relaunched = AgentUnsentDrafts(file: file, work: nil)
-        #expect(await relaunched.seed(for: "tab-1", session: nil)?.take()?.draft == "first words, then more")
+        let drafts = AgentUnsentDrafts(file: file, files: files)
+        let seed = try #require(drafts.seed(for: "tab-1", session: nil))
+        #expect(await seed.take()?.draft == "the saved draft")
+        drafts.typed("the saved draft, edited", for: "tab-1")
+        #expect(AgentUnsentDrafts(file: file, files: files).draft(for: "tab-1") == "the saved draft, edited")
+        drafts.typed("", for: "tab-1")
+        #expect(AgentUnsentDrafts(file: file, files: files).draft(for: "tab-1") == nil)
+        // A send starts the chat's session: the tab's copy goes (acpmux keeps the chat's draft).
+        drafts.typed("next", for: "tab-1")
+        let model = AgentPaneModel(host: MockAgentPaneHost())
+        drafts.wire(model) { "tab-1" }
+        _ = await model.respond(to: Self.request("chat.persistSession", ["sessionId": "s-1"]))
+        #expect(AgentUnsentDrafts(file: file, files: files).draft(for: "tab-1") == nil)
+    }
+
+    /// A seed made but never taken (the host failed before its handshake, and a stand-in page mounted
+    /// without the draft) leaves the draft waiting: that page's empty text does not clear it, and the
+    /// next host gets it. Taken, the page's clear clears it.
+    @Test func aSeedNeverTakenKeepsTheDraftForTheNextHost() async throws {
+        let directory = try Self.directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appending(path: AgentUnsentDrafts.fileName), files = AgentPaneStateFiles()
+        AgentUnsentDrafts(file: file, files: files).set("the saved draft", for: "tab-1")
+
+        let drafts = AgentUnsentDrafts(file: file, files: files)
+        _ = try #require(drafts.seed(for: "tab-1", session: nil))
+        drafts.typed("", for: "tab-1")
+        #expect(AgentUnsentDrafts(file: file, files: files).draft(for: "tab-1") == "the saved draft")
+        let retry = try #require(drafts.seed(for: "tab-1", session: nil))
+        #expect(await retry.take()?.draft == "the saved draft")
+        drafts.typed("", for: "tab-1")
+        #expect(AgentUnsentDrafts(file: file, files: files).draft(for: "tab-1") == nil)
+    }
+
+    /// A file this run cannot read is set aside, never replaced by an empty or partial one.
+    @Test func anUnreadableFileIsSetAsideNotOverwritten() throws {
+        let directory = try Self.directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appending(path: AgentUnsentDrafts.fileName), files = AgentPaneStateFiles()
+        let corrupt = Data("{\"tab-1\": \"half a dra".utf8)
+        try corrupt.write(to: file)
+
+        let drafts = AgentUnsentDrafts(file: file, files: files)
+        // Nothing written yet: the file is as it was.
+        drafts.typed("", for: "tab-2")
+        #expect(try Data(contentsOf: file) == corrupt)
+        drafts.typed("new text", for: "tab-2")
+        // A fresh store reads after the queued save (AgentPaneStateFile), so the move has run too.
+        #expect(AgentUnsentDrafts(file: file, files: files).draft(for: "tab-2") == "new text")
+        let names = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        let aside = try #require(names.first { $0.contains("unreadable") })
+        #expect(try Data(contentsOf: directory.appending(path: aside)) == corrupt)
+    }
+
+    /// A file that could not be read when the store loaded is set aside even when it reads by the
+    /// first save (a read that failed once): the store never loaded its drafts, so it never writes
+    /// over them.
+    @Test func aFileUnreadableAtLoadIsSetAsideEvenWhenItReadsLater() throws {
+        let directory = try Self.directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appending(path: AgentUnsentDrafts.fileName), files = AgentPaneStateFiles()
+        try Data("{\"tab-1\": \"half a dra".utf8).write(to: file)
+
+        let drafts = AgentUnsentDrafts(file: file, files: files)
+        let readable = Data("{\"tab-1\":\"kept draft\"}".utf8)
+        try readable.write(to: file)
+        drafts.typed("new text", for: "tab-2")
+        #expect(AgentUnsentDrafts(file: file, files: files).draft(for: "tab-2") == "new text")
+        let names = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        let aside = try #require(names.first { $0.contains("unreadable") })
+        #expect(try Data(contentsOf: directory.appending(path: aside)) == readable)
+    }
+
+    /// A text past the limit is refused, as acpmux refuses one: the saved draft stays, never nil.
+    @Test func aTextPastTheLimitKeepsTheSavedDraft() throws {
+        let directory = try Self.directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appending(path: AgentUnsentDrafts.fileName), files = AgentPaneStateFiles()
+        let saved = String(repeating: "s", count: AgentUnsentDrafts.maximumCharacters - 1)
+        AgentUnsentDrafts(file: file, files: files).set(saved, for: "tab-1")
+
+        let drafts = AgentUnsentDrafts(file: file, files: files)
+        // Typed before the page was handed it: the merge is past the limit, so nothing changes.
+        drafts.typed("x", for: "tab-1")
+        #expect(drafts.draft(for: "tab-1") == saved)
+        // The refused merge left the draft undelivered: the page's empty text (it has not been
+        // handed the draft yet) does not clear it.
+        drafts.typed("", for: "tab-1")
+        #expect(drafts.draft(for: "tab-1") == saved)
+        drafts.set(saved + "\n\nx", for: "tab-1")
+        #expect(AgentUnsentDrafts(file: file, files: files).draft(for: "tab-1") == saved)
+        // At the limit it is kept.
+        let atLimit = String(repeating: "s", count: AgentUnsentDrafts.maximumCharacters)
+        drafts.set(atLimit, for: "tab-1")
+        #expect(AgentUnsentDrafts(file: file, files: files).draft(for: "tab-1") == atLimit)
+    }
+
+    /// The merge keeps both texts once, and leaves a text that already holds the other as it is.
+    @Test func theMergeKeepsBothOnce() {
+        #expect(AgentUnsentDrafts.merged(typed: "b", kept: "a") == "a\n\nb")
+        #expect(AgentUnsentDrafts.merged(typed: "a", kept: "a") == "a")
+        #expect(AgentUnsentDrafts.merged(typed: "a\n\nb", kept: "a") == "a\n\nb")
+        // Never by substring: both drafts stay.
+        #expect(AgentUnsentDrafts.merged(typed: "debugging", kept: "bug") == "bug\n\ndebugging")
+        #expect(AgentUnsentDrafts.merged(typed: "a and more", kept: "a") == "a\n\na and more")
+        #expect(AgentUnsentDrafts.merged(typed: "b", kept: "a\n\nb") == "a\n\nb")
     }
 }
