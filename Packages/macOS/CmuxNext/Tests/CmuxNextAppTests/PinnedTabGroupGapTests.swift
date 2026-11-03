@@ -53,7 +53,11 @@ import Testing
         let tabGap = try harness.pill("tab2").minX - harness.pill("tab1").maxX
         let pinnedGap = try harness.pill("pin1").minX - harness.pill("pin0").maxX
         #expect(abs(pinnedGap - tabGap) < 0.5, "pinned tabs \(pinnedGap) pt apart, normal tabs \(tabGap) pt")
-        let divider = try #require(harness.divider(), "no divider between the pinned tabs and the first normal tab")
+        let line = harness.strip.pinnedDivider
+        let divider = try #require(harness.divider(), """
+            no divider between the pinned tabs and the first normal tab: hidden \(line.isHidden), opacity \(line.opacity), \
+            frame \(line.frame), in a layer \(line.superlayer != nil), on \(harness.strip.metrics.showsPinnedDivider)
+            """)
         let before = divider.minX - (try harness.pill("pin1").maxX)
         let after = (try harness.pill("tab0").minX) - divider.maxX
         #expect(abs(before - tabGap) < 0.5, "last pinned tab to divider \(before) pt, between tabs \(tabGap) pt")
