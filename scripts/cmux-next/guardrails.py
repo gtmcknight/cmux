@@ -2903,9 +2903,17 @@ def tree_sites(repo: Path, head: str, rule_id: str) -> list[str]:
     # The empty tree (git knows it without storing it), not a written empty commit: no loose objects.
     empty = subprocess.run(["git", "-C", str(repo), "hash-object", "-t", "tree", "--stdin"], input=b"",
                            capture_output=True, check=True).stdout.decode().strip()
-    refusals, warnings = settle(*measure(repo, empty, git(repo, "rev-parse", head).strip()))
+    found, warnings = measure(repo, empty, git(repo, "rev-parse", head).strip())
+    # measure() fails open (a warning) when the diff, the generic-signature context or this rule fails; a count
+    # that silently left the rule out would read as debt paid down, so the count fails closed instead.
+    failed = [text for source, text in warnings if source == "guardrails"
+              and text.startswith(("could not read", "generic-signature context", f"rule {rule_id} "))]
+    if failed:
+        raise SystemExit("guardrails --sites: no count, the rule did not run on the whole tree:\n" + "\n".join(failed))
+    refusals, _ = settle(found, [])
     sites = [f"{h.path}:{h.number}: {h.text.strip()}" for rule, hits in refusals if rule.id == rule_id for h in hits]
-    sites += [text for rule, text in warnings if rule == rule_id]
+    sites += [f"{h.path}:{h.number}: {h.text.strip()}" for rule, hits in found if rule.id == rule_id
+              for h in hits if getattr(h, "warn", False) and not (isinstance(h, NetHit) and h.additive and h.excess <= 0)]
     return sorted(sites)
 
 
